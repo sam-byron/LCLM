@@ -42,6 +42,7 @@ def process_chunk(lines: list[str]) -> tuple[str, int]:
 
 
 def main() -> None:
+    # dataset_path = Path("datasets/bnc_sentences.txt")
     dataset_path = Path("datasets/packed_bnc_blocks.txt")
     output_path = dataset_path.with_name(f"mapped_{dataset_path.name}")
 
@@ -53,7 +54,7 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=NUM_PROCESSES, initializer=init_worker, mp_context=mp_ctx) as executor:
             with tqdm(total=total_lines, desc="Mapping sentences", unit="line") as pbar:
                 for mapped_text, count in executor.map(process_chunk, chunks, chunksize=1):
-                    dst.write(mapped_text + "\n")
+                    dst.write(mapped_text.lower() + "\n")
                     pbar.update(count)
 
 

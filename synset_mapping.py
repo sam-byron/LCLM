@@ -1,10 +1,19 @@
+import functools
 import json
+import os
+from collections import Counter
 from pathlib import Path
 import re
+
 import spacy
 from spacy.matcher import PhraseMatcher
+from spacy.tokens import Doc
 from lemminflect import getInflection, getAllInflections
 import inflect
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 IRREGULAR_ADJ = {
     "good": ("better", "best"),
@@ -25,6 +34,10 @@ data = json.loads(CLUSTERS_PATH.read_text())
 synset2info = {}  # synset -> {pos, definition, words, canonical}
 word2synsets = {} # lower(word) -> set of synset ids
 
+# Stats for diagnostics
+REPLACE_STATS = Counter()
+LOG_EVERY = int(os.environ.get("SYNSET_STATS_EVERY", "10000"))
+
 for pos, entries in data["clusters_by_pos"].items():
     for entry in entries:
         syn = entry["synset"]
@@ -40,7 +53,15 @@ for pos, entries in data["clusters_by_pos"].items():
             word2synsets.setdefault(w.lower(), set()).add(syn)
 
 # ---------- NLP & matchers ----------
-nlp = spacy.load("en_core_web_sm")
+NLP_DISABLE = ["parser", "ner", "textcat"]
+
+
+@functools.lru_cache(maxsize=1)
+def load_nlp():
+    return spacy.load("en_core_web_sm", disable=NLP_DISABLE)
+
+
+nlp = load_nlp()
 # add lookups for lemminflect if not present; usually auto-installed with model
 
 # Build phrase matcher from cluster words (single + multiword)
@@ -210,7 +231,20 @@ def inflect_like(token_sample, canonical_lemma, upos, ptb_tag):
     )
 
 def replace_text(text):
-    doc = nlp(text)
+    doc = load_nlp()(text)
+    return replace_doc(doc)
+
+
+def get_nlp():
+    """Return a cached spaCy pipeline instance scoped to the current process."""
+    return load_nlp()
+
+
+def replace_doc(doc):
+    stats = Counter()
+    stats["docs"] += 1
+    stats["tokens_total"] += len(doc)
+    stats["tokens_alpha"] += sum(1 for tok in doc if tok.is_alpha)
 
     # 1) find MWE matches (longest-first, non-overlapping)
     matches = matcher(doc)
@@ -237,36 +271,61 @@ def replace_text(text):
     # handle MWEs first
     for sp in spans:
         if any(covered[i] for i in range(sp.start, sp.end)):
+            stats["mwe_skipped_overlap"] += 1
             continue
+        stats["mwe_considered"] += 1
+        span_len = sp.end - sp.start
+        stats["tokens_attempted"] += span_len
         cand = candidates_for_text(sp)
         best = best_synset_for_item(doc, sp, cand)
         if best:
             info = synset2info[best]
             canon = info["canonical"]
+            canon = best
             # inflect head token if needed (use span.root as head)
+            # Extract base word from synset ID (e.g., "word.v.02" -> "word")
+            match = re.match(r"^([^.]+)", best)
+            if match:
+                canon = match.group(1)
             inflected = inflect_like(sp.root, canon, sp.root.pos_, sp.root.tag_)
             # collapse to a single token replacement
             replacements[(sp.start, sp.end)] = inflected
             for i in range(sp.start, sp.end):
                 covered[i] = True
+            stats["mwe_replaced"] += 1
+            stats["tokens_replaced"] += span_len
+        else:
+            stats["mwe_no_best"] += 1
+            stats["tokens_no_best"] += span_len
 
     # Now single tokens not covered
     for i, tok in enumerate(doc):
         if covered[i] or not tok.is_alpha:
             continue
+        stats["tokens_considered"] += 1
         # collect candidates by word/lemma
         cands = set()
         for form in (tok.text.lower(), tok.lemma_.lower()):
             cands |= word2synsets.get(form, set())
         if not cands:
+            stats["tokens_no_candidates"] += 1
             continue
+        stats["tokens_with_candidates"] += 1
         best = best_synset_for_item(doc, doc[i:i+1], list(cands))
         if best:
             info = synset2info[best]
             canon = info["canonical"]
+            canon = best
+            match = re.match(r"^([^.]+)", best)
+            if match:
+                canon = match.group(1)
             repl = inflect_like(tok, canon, tok.pos_, tok.tag_)
             replacements[(i, i+1)] = repl
             covered[i] = True
+            stats["token_replacements"] += 1
+            stats["tokens_replaced"] += 1
+        else:
+            stats["tokens_no_best"] += 1
 
     # Rebuild text
     out = []
@@ -285,10 +344,30 @@ def replace_text(text):
         # keep original token
         out.append(doc[i].text)
         i += 1
+
+    REPLACE_STATS.update(stats)
+    if LOG_EVERY and LOG_EVERY > 0 and REPLACE_STATS["docs"] % LOG_EVERY == 0:
+        alpha = max(1, REPLACE_STATS["tokens_alpha"])
+        replaced_pct = REPLACE_STATS["tokens_replaced"] / alpha
+        no_cand_pct = REPLACE_STATS["tokens_no_candidates"] / alpha
+        no_best_pct = REPLACE_STATS["tokens_no_best"] / alpha
+        print(
+            "[synset_mapping] docs=%d tokens_alpha=%d replaced=%d (%.2f%%) no_cand=%d (%.2f%%) no_best=%d (%.2f%%)" % (
+                REPLACE_STATS["docs"],
+                REPLACE_STATS["tokens_alpha"],
+                REPLACE_STATS["tokens_replaced"],
+                replaced_pct * 100,
+                REPLACE_STATS["tokens_no_candidates"],
+                no_cand_pct * 100,
+                REPLACE_STATS["tokens_no_best"],
+                no_best_pct * 100,
+            ),
+            flush=True,
+        )
     # re-insert whitespace as in original
     # Simple join with spaces, then restore punctuation spacing roughly
     # (spaCy's .text preserved exists, but we altered tokens; fall back to naive spacing)
-    return spacy.tokens.Doc(nlp.vocab, words=out).text
+    return Doc(nlp.vocab, words=out).text
 
 # Example:
 if __name__ == "__main__":
