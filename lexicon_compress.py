@@ -36,6 +36,7 @@ Dependencies:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Iterator
@@ -121,15 +122,17 @@ def lesk_overlap(context_doc, sense_text: str, nlp) -> float:
 # -------------------------
 # Replacement choice & inflection
 # -------------------------
-def choose_replacement_word(entry: Dict[str, Any], original_lemma: str) -> str:
-    words = entry.get("words") or []
-    if not words:
-        return original_lemma
-    # Prefer a word different from the original lemma, else first
-    for w in words:
-        if w.lower().replace("_"," ") != original_lemma.lower():
-            return w.replace("_", " ")
-    return words[0].replace("_", " ")
+SYNSET_PREFIX_RE = re.compile(r"^([^.]+)")
+
+
+def synset_prefix(entry: Dict[str, Any], fallback: str) -> str:
+    syn = entry.get("synset", "")
+    match = SYNSET_PREFIX_RE.match(syn)
+    if not match:
+        return fallback
+    prefix = match.group(1)
+    # WordNet synsets use underscores for multiword lemmas; normalize to spaces.
+    return prefix.replace("_", " ") or fallback
 
 def inflect_like(repl: str, tok) -> str:
     """
@@ -394,8 +397,8 @@ def process_file(args):
                         continue
 
                     chosen_entry = entries[best_idx]
-                    repl_word = choose_replacement_word(chosen_entry, tok.lemma_)
-                    repl_infl = inflect_like(repl_word, tok)
+                    prefix = synset_prefix(chosen_entry, tok.lemma_)
+                    repl_infl = inflect_like(prefix, tok)
 
                     ws = tok.whitespace_
                     out_tokens.append(repl_infl + ws)
