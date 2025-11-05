@@ -43,14 +43,14 @@ def train_tokenizer(dataset, output_dir, vocab_size=8000):
     
     # Save
     wrapped_tokenizer.save_pretrained(output_dir)
-    print(f"Saved 16k tokenizer to {output_dir}")
+    print(f"Saved tokenizer to {output_dir}")
     print(f"Final vocab size: {len(wrapped_tokenizer)}")
     
     return wrapped_tokenizer
 
 if __name__ == "__main__":
     train_tokenizer(
-        dataset="./datasets/packed_bnc_blocks.txt",
+        dataset="./datasets/mapped_packed_bnc_blocks.txt",
         output_dir="./model_gpt2_tokenizer",
         vocab_size=8000
     )
