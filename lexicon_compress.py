@@ -36,10 +36,11 @@ Dependencies:
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Iterator
+from typing import Dict, List, Tuple, Any, Iterator, Optional
 
 import numpy as np
 import spacy
@@ -253,11 +254,43 @@ def build_word_lookup(senses_by_pos: Dict[str, List[Dict[str, Any]]]) -> Dict[Tu
 # -------------------------
 # Vectorized sense encoding
 # -------------------------
-def encode_texts(model: SentenceTransformer, texts: List[str], batch_size: int = 256) -> np.ndarray:
-    # sentence-transformers already batches internally; we convert to numpy float32 for memory
-    embs = model.encode(texts, batch_size=batch_size, show_progress_bar=False, convert_to_numpy=True)
+def encode_texts(
+    model: SentenceTransformer,
+    texts: List[str],
+    batch_size: int = 256,
+    *,
+    pool=None,
+    chunk_size: Optional[int] = None,
+    normalize: bool = False,
+) -> np.ndarray:
+    """Encode *texts* with SentenceTransformer, optionally via multi-process pool."""
+    if not texts:
+        dim = model.get_sentence_embedding_dimension() or 0
+        return np.zeros((0, dim), dtype=np.float32)
+
+    if pool is not None:
+        embs = model.encode_multi_process(
+            texts,
+            pool,
+            batch_size=batch_size,
+            chunk_size=chunk_size,
+            normalize_embeddings=normalize,
+        )
+    else:
+        embs = model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=normalize,
+        )
+
+    if not isinstance(embs, np.ndarray):
+        embs = np.asarray(embs)
     if embs.dtype != np.float32:
         embs = embs.astype(np.float32, copy=False)
+    if embs.ndim == 1:
+        embs = embs.reshape(1, -1)
     return embs
 
 # -------------------------
@@ -308,105 +341,170 @@ def process_file(args):
     # Embedding model
     model = SentenceTransformer(args.model)
 
-    # Precompute sense embeddings (vectorized)
-    sense_embs = encode_texts(model, sense_texts, batch_size=args.batch_size)
+    devices_arg = (args.devices or "").strip().lower()
+    target_devices: List[str] = []
+    mp_pool = None
+    if devices_arg and devices_arg != "none":
+        if devices_arg == "auto":
+            try:
+                import torch
 
-    # Pre-tokenize sense bags for Lesk quickly (use spaCy make_doc to avoid heavy tagging)
-    # We'll just lowercase alpha tokens length>2 for sense bag.
-    def sense_bag(text: str) -> set:
-        doc = nlp.make_doc(text)
-        return set([t.lower_ for t in doc if t.is_alpha and len(t) > 2])
+                if torch.cuda.is_available():
+                    gpu_count = max(0, torch.cuda.device_count())
+                    if gpu_count > 1:
+                        target_devices = [f"cuda:{i}" for i in range(gpu_count)]
+                else:
+                    workers = args.cpu_workers if args.cpu_workers > 0 else max(1, min(8, os.cpu_count() or 1))
+                    if workers > 1:
+                        target_devices = ["cpu"] * workers
+            except ImportError:
+                workers = args.cpu_workers if args.cpu_workers > 0 else max(1, min(8, os.cpu_count() or 1))
+                if workers > 1:
+                    target_devices = ["cpu"] * workers
+        else:
+            target_devices = [dev.strip() for dev in devices_arg.split(",") if dev.strip()]
 
-    sense_bags = [sense_bag(t) for t in sense_texts]
+        if len(target_devices) > 1:
+            print(
+                f"Starting SentenceTransformer multi-process pool on devices: {target_devices}",
+                file=sys.stderr,
+            )
+            mp_pool = model.start_multi_process_pool(target_devices=target_devices)
 
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-    print(
-        f"Streaming input from {input_path} in ~{args.chunk_chars} character chunks",
-        file=sys.stderr,
-    )
+    encode_pool = mp_pool if mp_pool is not None else None
 
-    sentence_bar = tqdm(desc="Processing sentences", unit="sent")
-    with output_path.open("w", encoding="utf-8") as out_f:
-        for doc in nlp.pipe(
-            stream_text_chunks(input_path, args.chunk_chars),
-            batch_size=args.nlp_batch_size,
-        ):
-            for sent in doc.sents:
-                sent_text = sent.text
-                if not sent_text:
+    try:
+        # Precompute sense embeddings (vectorized)
+        sense_embs = encode_texts(
+            model,
+            sense_texts,
+            batch_size=args.batch_size,
+            pool=encode_pool,
+            chunk_size=args.mp_chunk_size,
+        )
+        sense_norm = sense_embs / (np.linalg.norm(sense_embs, axis=1, keepdims=True) + 1e-12)
+
+        # Pre-tokenize sense bags for Lesk quickly (use spaCy make_doc to avoid heavy tagging)
+        # We'll just lowercase alpha tokens length>2 for sense bag.
+        def sense_bag(text: str) -> set:
+            doc = nlp.make_doc(text)
+            return set([t.lower_ for t in doc if t.is_alpha and len(t) > 2])
+
+        sense_bags = [sense_bag(t) for t in sense_texts]
+
+        input_path = Path(args.input)
+        output_path = Path(args.output)
+        print(
+            f"Streaming input from {input_path} in ~{args.chunk_chars} character chunks",
+            file=sys.stderr,
+        )
+
+        sentence_bar = tqdm(desc="Processing sentences", unit="sent")
+        with output_path.open("w", encoding="utf-8") as out_f:
+            for doc in nlp.pipe(
+                stream_text_chunks(input_path, args.chunk_chars),
+                batch_size=args.nlp_batch_size,
+                n_process=max(1, args.nlp_processes),
+            ):
+                sent_items = []
+                for sent in doc.sents:
+                    sent_text = sent.text
+                    if not sent_text:
+                        continue
+                    sent_items.append((sent, sent_text))
+
+                if not sent_items:
                     continue
 
-                ctx_emb = encode_texts(model, [sent_text], batch_size=32)[0]
-                ctx_norm = ctx_emb / (np.linalg.norm(ctx_emb) + 1e-12)
-                ctx_bag = {t.lemma_.lower() for t in sent if t.is_alpha and len(t) > 2 and t.pos_ in CONTENT_POS}
+                sent_texts = [txt for _, txt in sent_items]
+                ctx_embs = encode_texts(
+                    model,
+                    sent_texts,
+                    batch_size=args.context_batch_size,
+                    pool=encode_pool,
+                    chunk_size=args.mp_chunk_size,
+                )
+                ctx_norms = ctx_embs / (np.linalg.norm(ctx_embs, axis=1, keepdims=True) + 1e-12)
 
-                out_tokens: List[str] = []
-                for tok in sent:
-                    if not should_replace(tok):
-                        out_tokens.append(tok.text_with_ws)
-                        continue
+                for (sent, _), ctx_norm in zip(sent_items, ctx_norms):
+                    ctx_bag = {
+                        t.lemma_.lower()
+                        for t in sent
+                        if t.is_alpha and len(t) > 2 and t.pos_ in CONTENT_POS
+                    }
 
-                    key = (tok.lemma_.lower(), tok.pos_)
-                    entries = word_lookup.get(key)
+                    out_tokens: List[str] = []
+                    for tok in sent:
+                        if not should_replace(tok):
+                            out_tokens.append(tok.text_with_ws)
+                            continue
 
-                    if not entries:
-                        key2 = (tok.text.lower(), tok.pos_)
-                        entries = word_lookup.get(key2)
+                        key = (tok.lemma_.lower(), tok.pos_)
+                        entries = word_lookup.get(key)
 
-                    if not entries:
-                        out_tokens.append(tok.text_with_ws)
-                        continue
+                        if not entries:
+                            key2 = (tok.text.lower(), tok.pos_)
+                            entries = word_lookup.get(key2)
 
-                    cand_idxs = []
-                    for e in entries:
-                        idx = sense_index.get(e["synset"])
-                        if idx is not None:
-                            cand_idxs.append(idx)
-                    if not cand_idxs:
-                        out_tokens.append(tok.text_with_ws)
-                        continue
-                    cand_idxs = list(dict.fromkeys(cand_idxs))
+                        if not entries:
+                            out_tokens.append(tok.text_with_ws)
+                            continue
 
-                    cand_mat = sense_embs[cand_idxs]
-                    cand_norm = cand_mat / (np.linalg.norm(cand_mat, axis=1, keepdims=True) + 1e-12)
-                    cos = cand_norm @ ctx_norm
+                        cand_idxs = []
+                        for e in entries:
+                            idx = sense_index.get(e["synset"])
+                            if idx is not None:
+                                cand_idxs.append(idx)
+                        if not cand_idxs:
+                            out_tokens.append(tok.text_with_ws)
+                            continue
+                        cand_idxs = list(dict.fromkeys(cand_idxs))
 
-                    if ctx_bag:
-                        lesk_vals = np.array(
-                            [float(len(ctx_bag & sense_bags[i])) / (len(ctx_bag) + 1e-6) for i in cand_idxs],
-                            dtype=np.float32,
-                        )
-                    else:
-                        lesk_vals = np.zeros(len(cand_idxs), dtype=np.float32)
+                        cand_norm = sense_norm[cand_idxs]
+                        cos = cand_norm @ ctx_norm
 
-                    scores = cos + args.lesk_weight * lesk_vals
+                        if ctx_bag:
+                            lesk_vals = np.array(
+                                [
+                                    float(len(ctx_bag & sense_bags[i]))
+                                    / (len(ctx_bag) + 1e-6)
+                                    for i in cand_idxs
+                                ],
+                                dtype=np.float32,
+                            )
+                        else:
+                            lesk_vals = np.zeros(len(cand_idxs), dtype=np.float32)
 
-                    if len(scores) == 1:
-                        best_idx = 0
-                        margin = scores[0]
-                    else:
-                        order = np.argsort(-scores)
-                        best_idx = order[0]
-                        second = scores[order[1]] if len(scores) > 1 else -1.0
-                        margin = scores[order[0]] - second
+                        scores = cos + args.lesk_weight * lesk_vals
 
-                    best_score = float(scores[best_idx])
-                    if best_score < args.min_score or margin < args.abstain_margin:
-                        out_tokens.append(tok.text_with_ws)
-                        continue
+                        if len(scores) == 1:
+                            best_idx = 0
+                            margin = scores[0]
+                        else:
+                            order = np.argsort(-scores)
+                            best_idx = order[0]
+                            second = scores[order[1]] if len(scores) > 1 else -1.0
+                            margin = scores[order[0]] - second
 
-                    chosen_entry = entries[best_idx]
-                    prefix = synset_prefix(chosen_entry, tok.lemma_)
-                    repl_infl = inflect_like(prefix, tok)
+                        best_score = float(scores[best_idx])
+                        if best_score < args.min_score or margin < args.abstain_margin:
+                            out_tokens.append(tok.text_with_ws)
+                            continue
 
-                    ws = tok.whitespace_
-                    out_tokens.append(repl_infl + ws)
+                        chosen_entry = entries[best_idx]
+                        prefix = synset_prefix(chosen_entry, tok.lemma_)
+                        repl_infl = inflect_like(prefix, tok)
 
-                out_f.write("".join(out_tokens))
-                sentence_bar.update(1)
-    sentence_bar.close()
-    print(f"Wrote: {output_path}")
+                        ws = tok.whitespace_
+                        out_tokens.append(repl_infl + ws)
+
+                    out_f.write("".join(out_tokens))
+                    sentence_bar.update(1)
+        sentence_bar.close()
+        print(f"Wrote: {output_path}")
+    finally:
+        if mp_pool is not None:
+            SentenceTransformer.stop_multi_process_pool(mp_pool)
 
 def main():
     p = argparse.ArgumentParser(description="Unsupervised lexicon compression using candidate synsets and sentence embeddings.")
@@ -415,11 +513,20 @@ def main():
     p.add_argument("--out", dest="output", required=True, help="Path to write transformed text.")
     p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2", help="SentenceTransformer model name.")
     p.add_argument("--batch_size", type=int, default=256, help="Batch size for encoding sense texts.")
+    p.add_argument("--context_batch_size", type=int, default=256, help="Batch size for sentence/context encoding.")
     p.add_argument("--lesk_weight", type=float, default=0.1, help="Weight for Lesk overlap term.")
     p.add_argument("--abstain_margin", type=float, default=0.05, help="Min margin between top-2 scores to accept replacement.")
     p.add_argument("--min_score", type=float, default=0.25, help="Min absolute score to accept replacement.")
     p.add_argument("--chunk_chars", type=int, default=500_000, help="Approximate number of characters per spaCy chunk.")
     p.add_argument("--nlp_batch_size", type=int, default=4, help="spaCy pipe batch size for streaming chunks.")
+    p.add_argument("--nlp_processes", type=int, default=1, help="Number of spaCy processes for nlp.pipe (>=1).")
+    p.add_argument(
+        "--devices",
+        default="auto",
+        help="Comma-separated devices for SentenceTransformer multi-process encoding (e.g. 'cuda:0,cuda:1'). Use 'auto' (default) to detect or 'none' to disable.",
+    )
+    p.add_argument("--mp_chunk_size", type=int, default=500, help="Chunk size per worker for multi-process encoding.")
+    p.add_argument("--cpu_workers", type=int, default=0, help="CPU worker count when auto-detecting devices (0=auto).")
     p.add_argument("--max_length", type=int, default=2_000_000, help="Override spaCy max_length safeguard (in characters).")
     args = p.parse_args()
     process_file(args)
