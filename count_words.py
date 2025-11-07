@@ -6,7 +6,7 @@ def load_dataset(filename):
         return [line.strip() for line in f if line.strip()]
 
 # mapped_bnc = load_dataset('datasets/mapped_bnc_sentences.txt')
-mapped_bnc = load_dataset('datasets/bnc_sentences.txt')
+mapped_bnc = load_dataset('datasets/embed_synset_bnc_sentences.txt')
 # mapped_bnc = load_dataset('datasets/mapped_packed_bnc_blocks.txt')
 def count_frequent_words(mapped_bnc, min_coverage=MIN_TOTAL_WORD_COVERAGE_PERCENT):
     word_freq = {}

@@ -1,0 +1,1 @@
+python wordnet_clustering.py --input data/frequent_words_filtered.txt --out clusters.json --min-size 3

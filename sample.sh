@@ -1,0 +1,1 @@
+python sample.py --input datasets/bnc_sentences.txt --percent 1 --prefix bnc_sentences

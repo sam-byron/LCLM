@@ -171,7 +171,7 @@ def main():
                         help="Path to dataset (arrow format)")
     parser.add_argument("--text-file", type=str, default=None,
                         help="Path to text file (one example per line)")
-    parser.add_argument("--max-seq-length", type=int, default=512,
+    parser.add_argument("--max-seq-length", type=int, default=128,
                         help="Maximum sequence length")
     parser.add_argument("--validation-split", type=float, default=5,
                         help="Validation split percentage")
@@ -179,9 +179,9 @@ def main():
                         help="Output directory for checkpoints")
     parser.add_argument("--num-epochs", type=int, default=3,
                         help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16,
+    parser.add_argument("--batch-size", type=int, default=64,
                         help="Training batch size per device")
-    parser.add_argument("--learning-rate", type=float, default=1e-5,
+    parser.add_argument("--learning-rate", type=float, default=5e-4,
                         help="Learning rate")
     
     args = parser.parse_args()
@@ -340,7 +340,7 @@ def main():
         
         # Optimization
         fp16=torch.cuda.is_available(),
-        dataloader_num_workers=64,  # Use many workers to saturate CPUs
+        dataloader_num_workers=4,  # Use many workers to saturate CPUs
         dataloader_pin_memory=True,
         dataloader_persistent_workers=True,
         dataloader_prefetch_factor=8,  # Prefetch even more batches per worker

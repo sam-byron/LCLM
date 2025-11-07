@@ -49,6 +49,24 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 
 # -------------------------
+# JSON sanitization helper
+# -------------------------
+def _sanitize_for_json(obj: Any) -> Any:
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, set):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+# -------------------------
 # Utility: Simple cosine sim
 # -------------------------
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -69,10 +87,20 @@ def load_candidates(path: Path) -> Dict[str, Any]:
     #   "clusters_by_pos": { "n": [ {synset, pos, definition, examples[], words[]}, ...], ... } }
     return data
 
+def load_sysnet2codes(path: Path) -> Dict[str, str]:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
 # -------------------------
 # Build sense bank and indices
 # -------------------------
-def build_sense_bank(candidates: Dict[str, Any]) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int], List[str]]:
+def build_sense_bank(
+    candidates: Dict[str, Any],
+    *,
+    use_expanded_gloss: bool = True,
+    include_words_in_gloss: bool = True,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, int], List[str]]:
     """
     Returns:
         senses_by_pos: {'NOUN': [entry, ...], 'VERB': [...], 'ADJ': [...], 'ADV': [...]}
@@ -89,13 +117,22 @@ def build_sense_bank(candidates: Dict[str, Any]) -> Tuple[Dict[str, List[Dict[st
         if upos is None:
             continue
         for e in entries:
-            # expanded gloss: definition + first example if any
-            definition = (e.get("definition") or "").strip()
-            examples = e.get("examples") or []
-            ex = (" " + examples[0].strip()) if examples else ""
-            expanded = (definition + ex).strip()
+            # Prefer precomputed enriched text if provided
+            expanded = ""
+            if use_expanded_gloss:
+                expanded = (e.get("expanded_gloss") or "").strip()
             if not expanded:
-                expanded = definition or e.get("synset", "")
+                definition = (e.get("definition") or "").strip()
+                examples = e.get("examples") or []
+                ex_all = " ".join(x.strip() for x in examples if x and x.strip())
+                expanded = " ".join(p for p in [definition, ex_all] if p).strip()
+            # As a lightweight enrichment, optionally append synonyms/variants
+            if include_words_in_gloss:
+                words = e.get("words") or []
+                if words:
+                    expanded = (expanded + " " + " ".join(w.replace("_", " ") for w in words)).strip()
+            if not expanded:
+                expanded = e.get("synset", "") or "NA"
             # register
             global_idx = len(sense_texts)
             sense_index[e["synset"]] = global_idx
@@ -123,17 +160,19 @@ def lesk_overlap(context_doc, sense_text: str, nlp) -> float:
 # -------------------------
 # Replacement choice & inflection
 # -------------------------
-SYNSET_PREFIX_RE = re.compile(r"^([^.]+)")
+SYNSET_PARTS_RE = re.compile(r"^([^.]+)(\..*)?")
 
 
-def synset_prefix(entry: Dict[str, Any], fallback: str) -> str:
+def synset_parts(entry: Dict[str, Any], fallback: str) -> Tuple[str, str]:
     syn = entry.get("synset", "")
-    match = SYNSET_PREFIX_RE.match(syn)
+    match = SYNSET_PARTS_RE.match(syn)
     if not match:
-        return fallback
+        return fallback, ""
     prefix = match.group(1)
+    suffix = match.group(2) or ""
     # WordNet synsets use underscores for multiword lemmas; normalize to spaces.
-    return prefix.replace("_", " ") or fallback
+    prefix_norm = prefix.replace("_", " ") or fallback
+    return prefix_norm, suffix
 
 def inflect_like(repl: str, tok) -> str:
     """
@@ -334,7 +373,12 @@ def process_file(args):
 
     # Load candidates and build banks
     cand = load_candidates(Path(args.candidates))
-    senses_by_pos, sense_index, sense_texts = build_sense_bank(cand)
+    synset2codes = load_sysnet2codes(Path(args.synset2id)) if args.synset2id else {}
+    senses_by_pos, sense_index, sense_texts = build_sense_bank(
+        cand,
+        use_expanded_gloss=(not args.no_expanded_gloss),
+        include_words_in_gloss=(not args.no_include_words_in_gloss),
+    )
     # Word lookup
     word_lookup = build_word_lookup(senses_by_pos)
 
@@ -373,6 +417,40 @@ def process_file(args):
 
     encode_pool = mp_pool if mp_pool is not None else None
 
+    debug_path = Path(args.debug_json).expanduser().resolve() if args.debug_json else None
+    if debug_path:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_path.write_text(json.dumps({"status": "starting"}, indent=2), encoding="utf-8")
+
+    stats = {
+        "sentences": 0,
+        "content_tokens": 0,
+        "skipped_policy": 0,
+        "no_candidate": 0,
+        "no_index": 0,
+        "filtered_score": 0,
+        "replaced": 0,
+        "no_mapping": 0,
+    }
+    debug_items: List[Dict[str, Any]] = []
+    debug_limit = args.debug_limit if debug_path else 0
+
+    flush_interval = max(1, args.debug_flush_every) if debug_path else 0
+    last_flush_sent = 0
+
+    def flush_debug(status: str = "running") -> None:
+        if not debug_path:
+            return
+        payload = {
+            "status": status,
+            "stats": {k: int(v) for k, v in stats.items()},
+            "samples": _sanitize_for_json(debug_items),
+        }
+        debug_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    if debug_path:
+        flush_debug("running")
+
     try:
         # Precompute sense embeddings (vectorized)
         sense_embs = encode_texts(
@@ -406,38 +484,58 @@ def process_file(args):
                 batch_size=args.nlp_batch_size,
                 n_process=max(1, args.nlp_processes),
             ):
-                sent_items = []
-                for sent in doc.sents:
-                    sent_text = sent.text
-                    if not sent_text:
-                        continue
-                    sent_items.append((sent, sent_text))
-
-                if not sent_items:
+                sents = [s for s in doc.sents if s.text]
+                if not sents:
                     continue
 
-                sent_texts = [txt for _, txt in sent_items]
+                # Build extended context span per sentence
+                ctx_spans: List[Any] = []
+                for i, s in enumerate(sents):
+                    left = max(0, i - args.context_window_sents)
+                    right = min(len(sents), i + args.context_window_sents + 1)
+                    span_start = sents[left].start
+                    span_end = sents[right - 1].end
+                    ctx_span = doc[span_start:span_end]
+                    # Cap by max tokens if needed by trimming around the center sentence
+                    if len(ctx_span) > args.context_max_tokens:
+                        need = max(0, args.context_max_tokens - len(s))
+                        side = need // 2
+                        left_bound = max(ctx_span.start, s.start - side)
+                        right_bound = min(ctx_span.end, s.end + side + (need % 2))
+                        ctx_span = doc[left_bound:right_bound]
+                    ctx_spans.append(ctx_span)
+
+                ctx_texts = [sp.text for sp in ctx_spans]
                 ctx_embs = encode_texts(
                     model,
-                    sent_texts,
+                    ctx_texts,
                     batch_size=args.context_batch_size,
                     pool=encode_pool,
                     chunk_size=args.mp_chunk_size,
                 )
                 ctx_norms = ctx_embs / (np.linalg.norm(ctx_embs, axis=1, keepdims=True) + 1e-12)
 
-                for (sent, _), ctx_norm in zip(sent_items, ctx_norms):
+                for sent, ctx_span, ctx_norm in zip(sents, ctx_spans, ctx_norms):
+                    stats["sentences"] += 1
                     ctx_bag = {
                         t.lemma_.lower()
-                        for t in sent
+                        for t in ctx_span
                         if t.is_alpha and len(t) > 2 and t.pos_ in CONTENT_POS
                     }
 
                     out_tokens: List[str] = []
                     for tok in sent:
-                        if not should_replace(tok):
+                        if tok.is_space or tok.is_punct:
                             out_tokens.append(tok.text_with_ws)
                             continue
+
+                        if not should_replace(tok):
+                            if tok.pos_ in CONTENT_POS:
+                                stats["skipped_policy"] += 1
+                            out_tokens.append(tok.text_with_ws)
+                            continue
+
+                        stats["content_tokens"] += 1
 
                         key = (tok.lemma_.lower(), tok.pos_)
                         entries = word_lookup.get(key)
@@ -447,6 +545,16 @@ def process_file(args):
                             entries = word_lookup.get(key2)
 
                         if not entries:
+                            stats["no_candidate"] += 1
+                            if debug_limit and len(debug_items) < debug_limit:
+                                debug_items.append(
+                                    {
+                                        "token": tok.text,
+                                        "lemma": tok.lemma_,
+                                        "pos": tok.pos_,
+                                        "reason": "no_candidate",
+                                    }
+                                )
                             out_tokens.append(tok.text_with_ws)
                             continue
 
@@ -456,6 +564,17 @@ def process_file(args):
                             if idx is not None:
                                 cand_idxs.append(idx)
                         if not cand_idxs:
+                            stats["no_index"] += 1
+                            if debug_limit and len(debug_items) < debug_limit:
+                                debug_items.append(
+                                    {
+                                        "token": tok.text,
+                                        "lemma": tok.lemma_,
+                                        "pos": tok.pos_,
+                                        "reason": "no_index",
+                                        "synsets": [e.get("synset") for e in entries],
+                                    }
+                                )
                             out_tokens.append(tok.text_with_ws)
                             continue
                         cand_idxs = list(dict.fromkeys(cand_idxs))
@@ -488,38 +607,79 @@ def process_file(args):
 
                         best_score = float(scores[best_idx])
                         if best_score < args.min_score or margin < args.abstain_margin:
+                            stats["filtered_score"] += 1
+                            if debug_limit and len(debug_items) < debug_limit:
+                                debug_items.append(
+                                    {
+                                        "token": tok.text,
+                                        "lemma": tok.lemma_,
+                                        "pos": tok.pos_,
+                                        "reason": "filtered_score",
+                                        "best_score": best_score,
+                                        "margin": margin,
+                                        "top_synset": entries[best_idx].get("synset"),
+                                    }
+                                )
                             out_tokens.append(tok.text_with_ws)
                             continue
 
                         chosen_entry = entries[best_idx]
-                        prefix = synset_prefix(chosen_entry, tok.lemma_)
-                        repl_infl = inflect_like(prefix, tok)
+                        if args.synset2id:
+                            repl_text = synset2codes.get(chosen_entry.get("synset", ""))
+                            if repl_text is None:
+                                stats["no_mapping"] += 1
+                                if debug_limit and len(debug_items) < debug_limit:
+                                    debug_items.append(
+                                        {
+                                            "token": tok.text,
+                                            "lemma": tok.lemma_,
+                                            "pos": tok.pos_,
+                                            "reason": "no_mapping",
+                                            "synset": chosen_entry.get("synset"),
+                                        }
+                                    )
+                                out_tokens.append(tok.text_with_ws)
+                                continue
+                        else:
+                            prefix, suffix = synset_parts(chosen_entry, tok.lemma_)
+                            repl_infl = inflect_like(prefix, tok)
+                            repl_text = f"{repl_infl}{suffix}" if args.keep_suffix and suffix else repl_infl
 
                         ws = tok.whitespace_
-                        out_tokens.append(repl_infl + ws)
+                        out_tokens.append(repl_text + ws)
+                        stats["replaced"] += 1
 
                     out_f.write("".join(out_tokens))
                     sentence_bar.update(1)
+
+                    if debug_path and stats["sentences"] - last_flush_sent >= flush_interval:
+                        flush_debug("running")
+                        last_flush_sent = stats["sentences"]
         sentence_bar.close()
         print(f"Wrote: {output_path}")
     finally:
         if mp_pool is not None:
             SentenceTransformer.stop_multi_process_pool(mp_pool)
+        if debug_path:
+            flush_debug("complete")
+            print(f"Debug stats written to {debug_path}", file=sys.stderr)
 
 def main():
     p = argparse.ArgumentParser(description="Unsupervised lexicon compression using candidate synsets and sentence embeddings.")
     p.add_argument("--candidates", "-c", required=True, help="Path to candidate synsets JSON file.")
+    p.add_argument("--synset2id", "-s", required=False, help="Path to synset to ID mapping JSON file.")
     p.add_argument("--in", dest="input", required=True, help="Path to input text file.")
     p.add_argument("--out", dest="output", required=True, help="Path to write transformed text.")
     p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2", help="SentenceTransformer model name.")
-    p.add_argument("--batch_size", type=int, default=256, help="Batch size for encoding sense texts.")
-    p.add_argument("--context_batch_size", type=int, default=256, help="Batch size for sentence/context encoding.")
-    p.add_argument("--lesk_weight", type=float, default=0.1, help="Weight for Lesk overlap term.")
-    p.add_argument("--abstain_margin", type=float, default=0.05, help="Min margin between top-2 scores to accept replacement.")
-    p.add_argument("--min_score", type=float, default=0.25, help="Min absolute score to accept replacement.")
+    p.add_argument("--batch_size", type=int, default=512, help="Batch size for encoding sense texts.")
+    p.add_argument("--context_batch_size", type=int, default=512, help="Batch size for sentence/context encoding.")
+    p.add_argument("--lesk_weight", type=float, default=0.2, help="Weight for Lesk overlap term.")
+    p.add_argument("--abstain_margin", type=float, default=0.02, help="Min margin between top-2 scores to accept replacement.")
+    p.add_argument("--min_score", type=float, default=0.12, help="Min absolute score to accept replacement.")
     p.add_argument("--chunk_chars", type=int, default=500_000, help="Approximate number of characters per spaCy chunk.")
     p.add_argument("--nlp_batch_size", type=int, default=4, help="spaCy pipe batch size for streaming chunks.")
     p.add_argument("--nlp_processes", type=int, default=1, help="Number of spaCy processes for nlp.pipe (>=1).")
+    p.add_argument("--keep-suffix", action="store_true", help="If set, append the original synset suffix (e.g. '.v.03') after inflecting the replacement word.")   
     p.add_argument(
         "--devices",
         default="auto",
@@ -528,6 +688,15 @@ def main():
     p.add_argument("--mp_chunk_size", type=int, default=500, help="Chunk size per worker for multi-process encoding.")
     p.add_argument("--cpu_workers", type=int, default=0, help="CPU worker count when auto-detecting devices (0=auto).")
     p.add_argument("--max_length", type=int, default=2_000_000, help="Override spaCy max_length safeguard (in characters).")
+    p.add_argument("--debug-json", help="Optional path to write JSON diagnostics about skipped tokens.")
+    p.add_argument("--debug-limit", type=int, default=2000, help="Max diagnostic entries to store when debug-json is set.")
+    p.add_argument("--debug-flush-every", type=int, default=1000, help="Flush debug JSON after this many sentences (default 1000).")
+    # Enrichment controls
+    p.add_argument("--no_expanded_gloss", action="store_true", help="Ignore 'expanded_gloss' in candidates even if present.")
+    p.add_argument("--no_include_words_in_gloss", action="store_true", help="Do not append cluster 'words' to sense text.")
+    # Wider context controls
+    p.add_argument("--context_window_sents", type=int, default=1, help="Number of neighboring sentences on each side to include in context.")
+    p.add_argument("--context_max_tokens", type=int, default=256, help="Max tokens in the extended context window (caps very long blocks).")
     args = p.parse_args()
     process_file(args)
 

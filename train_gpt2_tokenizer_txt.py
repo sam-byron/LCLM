@@ -1,10 +1,11 @@
+import json
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders, trainers, processors
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizerFast, AddedToken
 import glob
 import os
 from datasets import load_from_disk
 
-def train_tokenizer(dataset, output_dir, vocab_size=8000):
+def train_tokenizer(dataset, vocab_size=8000):
     """Train a custom GPT-2 style tokenizer with reduced vocabulary."""
     
     # Initialize a BPE tokenizer (same as GPT-2)
@@ -40,17 +41,32 @@ def train_tokenizer(dataset, output_dir, vocab_size=8000):
         pad_token="<|endoftext|>",
         unk_token="<|endoftext|>",
     )
-    
-    # Save
-    wrapped_tokenizer.save_pretrained(output_dir)
-    print(f"Saved tokenizer to {output_dir}")
-    print(f"Final vocab size: {len(wrapped_tokenizer)}")
+    if wrapped_tokenizer.pad_token is None:
+        wrapped_tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+
+   
     
     return wrapped_tokenizer
 
+def add_special_tokens(tok: PreTrainedTokenizerFast):
+    with open("data/synset2ids.json", "r") as f:
+        synset2ids = json.load(f)
+
+    cluster_added = [
+        AddedToken(v, lstrip=False, rstrip=False, single_word=False, normalized=False)
+        for k, v in synset2ids.items()
+    ]
+    added_codes = tok.add_tokens(cluster_added, special_tokens=False)
+    print(f"Added {added_codes} cluster tokens as AddedToken entries.")
+
 if __name__ == "__main__":
-    train_tokenizer(
-        dataset="./datasets/mapped_packed_bnc_blocks.txt",
-        output_dir="./model_gpt2_tokenizer",
-        vocab_size=8000
+    wrapped_tokenizer = train_tokenizer(
+        dataset="./datasets/embed_synset_bnc_sentences.txt",
+        vocab_size=12000
     )
+
+    output_dir="./model_gpt2_tokenizer"
+     # Save
+    wrapped_tokenizer.save_pretrained(output_dir)
+    print(f"Saved tokenizer to {output_dir}")
+    print(f"Final vocab size: {len(wrapped_tokenizer)}")
